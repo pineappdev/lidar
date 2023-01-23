@@ -77,6 +77,13 @@ def normal_pdf(mean_, std_, x: np.ndarray) -> np.ndarray:
     return np.exp(-np.square((x - mean_) / std_) / 2) / (std_ * np.sqrt(2 * math.pi))
 
 
+def normpdf(mean, sd, x):
+    var = sd ** 2
+    denom = (2 * math.pi * var) ** .5
+    num = np.exp(-(x - mean) ** 2 / (2 * var))
+    return num / denom
+
+
 class LocalizationMap:
     def __init__(self, environment):
         # We could compute lidar for all cells and thus tell where most probably we are?
@@ -98,9 +105,9 @@ class LocalizationMap:
 
         self.eta = 1.  # TODO: how to compute this?
 
-        self.measurement_pdf: Callable[[np.ndarray], np.ndarray] = lambda x: np.multiply.reduce(normal_pdf(1,
-                                                                                                           environment.lidar_stochasticity,
-                                                                                                           x), axis=1)
+        self.measurement_pdf: Callable[[np.ndarray], np.ndarray] = lambda x: np.multiply.reduce(normpdf(1.,
+                                                                                                        environment.lidar_stochasticity,
+                                                                                                        x), axis=1)
 
         # self.movement_pdf: Callable[[np.ndarray], np.ndarray] = lambda x: 1 - environment.position_stochasticity
 
@@ -137,6 +144,7 @@ class LocalizationMap:
         pdf_result /= np.sum(
             pdf_result)  # since pdf returns very small probabilities (we're in a continuous distribution),
         # we have to normalize probabilities to sum to 1
+        # TODO: take into account that we couldn't make the move because we're not at a given location and there's a wall?
         self.probabilities = self.eta * pdf_result
 
     def position_update(self, distances: np.ndarray, delta: np.ndarray = None):
@@ -199,7 +207,10 @@ class LocalizationAgent:
         """
         # TODO: why won't we do just measurement and then position model updates
         # and instead docstring suggests to do measurement -> position model -> measurement
-        distances = self.environment.lidar()
+
+        # TODO: use lidar multiple times and take a mean?
+        distances = self.environment.lidar()[1]
+
         self.localization_map.position_update_by_measurement_model(distances[1])
         next_step = self._get_next_step()
 
@@ -207,7 +218,12 @@ class LocalizationAgent:
         print("Predicted position: {}".format(list(self.localization_map.get_most_probable_position())))
         print("Next step: {}".format(next_step))
 
+        self.environment.step(tuple(next_step))
+
+        distances = self.environment.lidar()[1]
         self.localization_map.position_update(distances, next_step)
+
+        # self.localization_map.position_update_by_motion_model(next_step)
 
     def visualize(self) -> np.ndarray:
         """

@@ -77,11 +77,19 @@ def normal_pdf(mean_, std_, x: np.ndarray) -> np.ndarray:
     return np.exp(-np.square((x - mean_) / std_) / 2) / (std_ * np.sqrt(2 * math.pi))
 
 
-def normpdf(mean, sd, x):
-    var = sd ** 2
-    denom = (2 * math.pi * var) ** .5
-    num = np.exp(-(x - mean) ** 2 / (2 * var))
-    return num / denom
+def partition_pdf(mean, sd, x):
+    proportion = np.abs(x - mean) / sd
+    # if proportion < 0.1sd then 0.9
+    # elif it's < 0.5 then 0.7
+    # elif it's < 1.0 then 0.5
+    # elif it's < 2.0 then 0.3
+    # else 0.1
+    return np.select([proportion < 0.1, proportion < 0.5, proportion < 1., proportion < 2., proportion >= 0.2],
+                     [np.full_like(proportion, 0.9),
+                      np.full_like(proportion, 0.7),
+                      np.full_like(proportion, 0.5),
+                      np.full_like(proportion, 0.3),
+                      np.full_like(proportion, 0.1)])
 
 
 class LocalizationMap:
@@ -105,11 +113,10 @@ class LocalizationMap:
 
         self.eta = 1.  # TODO: how to compute this?
 
-        self.measurement_pdf: Callable[[np.ndarray], np.ndarray] = lambda x: np.multiply.reduce(normpdf(1.,
-                                                                                                        environment.lidar_stochasticity,
-                                                                                                        x), axis=1)
-
-        # self.movement_pdf: Callable[[np.ndarray], np.ndarray] = lambda x: 1 - environment.position_stochasticity
+        self.measurement_pdf: Callable[[np.ndarray], np.ndarray] = lambda x: np.multiply.reduce(normal_pdf(1.,
+                                                                                                              environment.lidar_stochasticity,
+                                                                                                              x),
+                                                                                                axis=1)
 
         self.environment = environment
 
@@ -121,16 +128,17 @@ class LocalizationMap:
         :param delta: Movement taken by agent in the previous turn.
         It should be one of [[0, 1], [0, -1], [1, 0], [-1, 0]]
         """
-        """ TODO: your code goes here """
         next_probabilities = self.probabilities * self.environment.position_stochasticity
 
         for i, cell_index in enumerate(self.empty_cells_indices):
             prev_cell_index = cell_index - delta
 
             if is_valid_free_pos_on_occ_map(self.environment.gridmap, prev_cell_index):
-                next_probabilities[i] += (1 - self.environment.position_stochasticity) * self.probabilities[
-                    list(zip(*np.where(np.all(self.empty_cells_indices == cell_index - delta, axis=1))))[
-                        0]]
+                prev_cell_index_in_arr = \
+                list(zip(*np.where(np.all(self.empty_cells_indices == cell_index - delta, axis=1))))[
+                    0]
+                prev_cell_prob = self.probabilities[prev_cell_index_in_arr]
+                next_probabilities[i] += (1 - self.environment.position_stochasticity) * prev_cell_prob
 
         self.probabilities = next_probabilities
 
@@ -141,10 +149,8 @@ class LocalizationMap:
         """
         pdf_result = self.measurement_pdf(
             distances / self.lidars) * self.probabilities
-        pdf_result /= np.sum(
-            pdf_result)  # since pdf returns very small probabilities (we're in a continuous distribution),
-        # we have to normalize probabilities to sum to 1
-        # TODO: take into account that we couldn't make the move because we're not at a given location and there's a wall?
+        # pdf_result /= np.sum(
+        #     pdf_result)  # we have to normalize probabilities to sum to 1
         self.probabilities = self.eta * pdf_result
 
     def position_update(self, distances: np.ndarray, delta: np.ndarray = None):
@@ -159,6 +165,8 @@ class LocalizationAgent:
         self.position_probability_matrix = np.zeros_like(environment.gridmap)
         self._update_position_probability_matrix()
         self.cur_pos2_best_move = self._get_best_move_dict()
+        self.best_move_array = np.array(
+            [tuple(self.cur_pos2_best_move[tuple(ind)]) for ind in self.localization_map.empty_cells_indices])
 
     def _squeeze(self, x: Tuple[int, int]) -> Tuple[int, int]:
         return tuple(int(y / 10) for y in x)
@@ -195,8 +203,13 @@ class LocalizationAgent:
             self.position_probability_matrix)
 
     def _get_next_step(self) -> np.ndarray:
-        most_probable_cur_pos = self.localization_map.get_most_probable_position()
-        return self.cur_pos2_best_move[most_probable_cur_pos]
+        # TODO: which one to choose?
+        # most_probable_cur_pos = self.localization_map.get_most_probable_position()
+        res = np.sum(self.localization_map.probabilities.reshape(-1, 1) * self.best_move_array, axis=0)
+        ind_1 = np.argmax(np.abs(res))
+        move = np.array([0, 0])
+        move[ind_1] = 1 * np.sign(res[ind_1])
+        return move
 
     def step(self) -> None:
         """
@@ -209,9 +222,9 @@ class LocalizationAgent:
         # and instead docstring suggests to do measurement -> position model -> measurement
 
         # TODO: use lidar multiple times and take a mean?
-        distances = self.environment.lidar()[1]
+        # distances = self.environment.lidar()[1]
 
-        self.localization_map.position_update_by_measurement_model(distances[1])
+        # self.localization_map.position_update_by_measurement_model(distances[1])
         next_step = self._get_next_step()
 
         print("Actual position: {}".format(list(self.environment.xy_to_rowcol(self.environment.position()))))
@@ -221,6 +234,7 @@ class LocalizationAgent:
         self.environment.step(tuple(next_step))
 
         distances = self.environment.lidar()[1]
+        # self.localization_map.position_update_by_measurement_model(distances)
         self.localization_map.position_update(distances, next_step)
 
         # self.localization_map.position_update_by_motion_model(next_step)

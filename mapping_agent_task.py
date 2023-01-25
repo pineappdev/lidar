@@ -1,6 +1,6 @@
 import math
 from enum import Enum
-from typing import Tuple, Optional, Generator, Collection, Iterable
+from typing import Tuple, Optional, Generator, Iterable
 
 import cv2
 import numpy as np
@@ -33,7 +33,7 @@ class OccupancyMap:
             prob / (1 - prob))
         if not occupied:
             if distance > 10:
-                correction *= 1 / (distance / 5)  # dimnish changes for far cells
+                correction *= 1 / (distance / 7)  # dimnish changes for far cells
         self.occ_map[pos] += np.log(
             prob / (1 - prob))
 
@@ -70,7 +70,7 @@ class OccupancyMap:
         Tuple[int, int], None, None]:
         pos_stopped = tuple((np.array(pos_rowcol) + np.ceil(
             np.array([np.cos(angle) * distance_rowcol, np.sin(angle) * distance_rowcol]))).astype(int))
-        if np.all(np.array(pos_stopped) < 110):
+        if np.all((np.array(pos_stopped) < 110) & (np.array(pos_stopped) > 0)):
             yield pos_stopped
 
     def map_update(self, pos: Tuple[float, float], angles: np.ndarray, distances: np.ndarray) -> None:
@@ -110,6 +110,9 @@ class MappingAgent:
         self.turn = False
         self.init_find_wall_right = True
         self.init_moves = 100
+        self.start_position = None
+        self.comeback_cooldown = 10
+        self.path_to_goal = None
 
     def clockwise_turn(self, direction: Direction):
         if direction == Direction.UP:
@@ -145,6 +148,23 @@ class MappingAgent:
         # if there's no wall on our right, we'll turn right, take a few steps, and try to stick to the wall
         # on our right again.
         # if we cannot move forward (or right), we will turn left.
+        if self.comeback_cooldown > 0:
+            self.comeback_cooldown -= 1
+        else:
+            if self.environment.position() == self.start_position:
+                # we came back to our original point!
+                # This means we've explored the entire maze
+                # so now we can use A* to come to our goal.
+                if self.path_to_goal is None:
+                    self.path_to_goal = a_star_search(np.rint(self.visualize()).astype(int),
+                                                      self.environment.xy_to_rowcol(self.start_position),
+                                                      self.environment.xy_to_rowcol(self.environment.goal_position))
+            if self.path_to_goal is not None:
+                cur_pos = self.environment.xy_to_rowcol(self.environment.position())
+                next_pos = self.path_to_goal[cur_pos]  # TODO: this might not be safe because of numeric operations.
+                # instead we could just use start node and memorize all positions on the path and never ask for our actual position
+                return tuple(np.array(next_pos) - np.array(cur_pos))
+
         dir1, dir2 = self.current_dirs
 
         # At first go right as far as we can.
@@ -153,6 +173,7 @@ class MappingAgent:
             if self.can_go_in_direction(Direction.RIGHT.value):
                 self.init_moves -= 1
                 return Direction.RIGHT.value
+            self.start_position = self.environment.position()
             self.init_moves = 0
 
         if self.turn:

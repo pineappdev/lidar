@@ -1,4 +1,5 @@
 import math
+from enum import Enum
 from typing import Tuple, Optional, Generator, Collection, Iterable
 
 import cv2
@@ -7,6 +8,7 @@ from matplotlib import pyplot as plt
 
 from environment import Environment
 from utils import generate_maze
+from localization_agent_task import a_star_search
 
 
 class OccupancyMap:
@@ -14,7 +16,7 @@ class OccupancyMap:
         self.occ_map = 0.5 * np.ones_like(
             environment.gridmap)  # TODO: gridmap's 10x actual gridmap, we could make our occ_map smaller...
         self.environment = environment
-        self.prob_cell_taken_if_observed_taken = 0.6
+        self.prob_cell_taken_if_observed_taken = 0.53
 
     def point_update(self, pos: Tuple[int, int], distance: Optional[float], total_distance: Optional[float],
                      occupied: bool) -> None:
@@ -27,24 +29,29 @@ class OccupancyMap:
         """
         # TODO: make use of distance and use knowledge on noise distribution to compute prob_cell_taken_if_observed_taken more accurately?
         prob = self.prob_cell_taken_if_observed_taken if occupied else 1 - self.prob_cell_taken_if_observed_taken
+        correction = np.log(
+            prob / (1 - prob))
+        if not occupied:
+            if distance > 10:
+                correction *= 1 / (distance / 5)  # dimnish changes for far cells
         self.occ_map[pos] += np.log(
             prob / (1 - prob))
 
     @staticmethod
     def _ray_trace_passed_cells_revised(angle: float,
                                         distance_rowcol: float,
-                                        pos_rowcol: Tuple[int, int]) -> Iterable[Tuple[int, int]]:
+                                        pos_rowcol: Tuple[int, int]) -> Iterable[Tuple[float, Tuple[int, int]]]:
         distance_x = math.floor(np.abs(np.cos(angle)) * distance_rowcol)
         pos = np.array(pos_rowcol, dtype=np.float64)
         func = np.floor if np.cos(angle) > 0 else np.ceil
-        passed_cells = {(tuple(pos.astype(int)))}
+        passed_cells = {(0., tuple(pos.astype(int)))}
         for i in range(1, distance_x):
             pos[0] = pos_rowcol[0] + i * np.sign(np.cos(angle))
             pos[1] = pos_rowcol[1] + i * np.sin(angle)
-            passed_cells.add(tuple(func(pos).astype(int)))
+            passed_cells.add((np.linalg.norm(pos), tuple(func(pos).astype(int))))
             if np.all(func(pos) == pos):
-                passed_cells.add(tuple((pos + np.array([0, 1])).astype(int)))
-                passed_cells.add(tuple((pos + np.array([1, 0])).astype(int)))
+                passed_cells.add((np.linalg.norm(pos), tuple((pos + np.array([0, 1])).astype(int))))
+                passed_cells.add((np.linalg.norm(pos), tuple((pos + np.array([1, 0])).astype(int))))
 
         distance_y = math.floor(np.abs(np.sin(angle)) * distance_rowcol)
         pos = np.array(pos_rowcol, dtype=np.float64)
@@ -52,11 +59,11 @@ class OccupancyMap:
         for i in range(1, distance_y):
             pos[0] = pos_rowcol[0] + i * np.cos(angle)
             pos[1] = pos_rowcol[1] + i * np.sign(np.sin(angle))
-            passed_cells.add(tuple(func(pos).astype(int)))
+            passed_cells.add((np.linalg.norm(pos), tuple(func(pos).astype(int))))
             if np.all(func(pos) == pos):
-                passed_cells.add(tuple((pos + np.array([0, 1])).astype(int)))
-                passed_cells.add(tuple((pos + np.array([1, 0])).astype(int)))
-        return passed_cells
+                passed_cells.add((np.linalg.norm(pos), tuple((pos + np.array([0, 1])).astype(int))))
+                passed_cells.add((np.linalg.norm(pos), tuple((pos + np.array([1, 0])).astype(int))))
+        return [x for x in passed_cells if np.all((np.array(x[1]) < 110) & (np.array(x[1]) >= 0))]
 
     @staticmethod
     def _ray_stop_cells(angle: float, pos_rowcol: Tuple[int, int], distance_rowcol: np.ndarray) -> Generator[
@@ -78,17 +85,98 @@ class OccupancyMap:
         # for each angle, compute which cells it passes through
         # and at which it stops
         for angle, distance_rowcol in zip(angles, distances_rowcol):
-            for passed_cell in self._ray_trace_passed_cells_revised(angle, distance_rowcol, pos_rowcol):
-                self.point_update(passed_cell, None, None, occupied=False)
+            for dist, passed_cell in self._ray_trace_passed_cells_revised(angle, distance_rowcol, pos_rowcol):
+                self.point_update(passed_cell, dist, None, occupied=False)
 
             for stop_cell in self._ray_stop_cells(angle, pos_rowcol, distance_rowcol):
-                self.point_update(stop_cell, None, None, occupied=True)
+                self.point_update(stop_cell, distance_rowcol, None, occupied=True)
+
+
+class Direction(Enum):
+    UP = (1, 0)
+    DOWN = (-1, 0)
+    LEFT = (0, -1)
+    RIGHT = (0, 1)
 
 
 class MappingAgent:
+
     def __init__(self, environment):
         self.occ_map = OccupancyMap(environment)
         self.environment = environment
+
+        self.current_dirs: Tuple[Direction, Direction] = (Direction.UP, Direction.RIGHT)
+        self.turn_remaining_moves = 0
+        self.turn = False
+        self.init_find_wall_right = True
+        self.init_moves = 100
+
+    def clockwise_turn(self, direction: Direction):
+        if direction == Direction.UP:
+            return Direction.RIGHT
+        elif direction == Direction.RIGHT:
+            return Direction.DOWN
+        elif direction == Direction.DOWN:
+            return Direction.LEFT
+        else:
+            return Direction.UP
+
+    def anti_clockwise_turn(self, direction: Direction):
+        if direction == Direction.UP:
+            return Direction.LEFT
+        elif direction == Direction.RIGHT:
+            return Direction.UP
+        elif direction == Direction.DOWN:
+            return Direction.RIGHT
+        else:
+            return Direction.DOWN
+
+    def can_go_in_direction(self,
+                            direction: Tuple[int, int]):
+        pos = np.array(self.environment.xy_to_rowcol(self.environment.position()))
+        dir = np.array(direction)
+        next_ = pos + dir
+        if np.any(next_ >= 110) or np.any(next_ < 0):
+            return False
+        return self.environment.gridmap[tuple(next_)] < 0.8
+
+    def choose_dir(self) -> Tuple[int, int]:
+        # we will move by always sticking to the wall on our right and moving forward.
+        # if there's no wall on our right, we'll turn right, take a few steps, and try to stick to the wall
+        # on our right again.
+        # if we cannot move forward (or right), we will turn left.
+        dir1, dir2 = self.current_dirs
+
+        # At first go right as far as we can.
+        if self.init_moves > 0:
+            # TODO: don't always try to go right, choose direction leading to the closest wall...
+            if self.can_go_in_direction(Direction.RIGHT.value):
+                self.init_moves -= 1
+                return Direction.RIGHT.value
+            self.init_moves = 0
+
+        if self.turn:
+            self.turn_remaining_moves -= 1
+            if self.turn_remaining_moves == 0:
+                self.turn = False
+            return self.current_dirs[0].value
+
+        if not self.can_go_in_direction(dir2.value):
+            if self.can_go_in_direction(dir1.value):
+                # we can stick to the wall
+                return dir1.value
+            else:
+                # we can't go up or right, we have to turn left
+                self.turn = True
+                self.turn_remaining_moves = 3
+                self.current_dirs = tuple(self.anti_clockwise_turn(dir) for dir in self.current_dirs)
+                return self.current_dirs[0].value
+
+        # initiate turn right
+        self.turn = True
+        self.current_dirs = tuple(self.clockwise_turn(dir) for dir in self.current_dirs)
+        self.turn_remaining_moves = 5
+        return self.current_dirs[0].value
 
     def step(self) -> None:
         """
@@ -102,10 +190,9 @@ class MappingAgent:
                                 lidar[0],
                                 lidar[1])
 
-        # TODO: how to choose the next step?
-        # use DFS to move in general direction we're not sure yet? (probabilities there are around 0.5)
-        dirs = [(0, 1), (1, 0), (-1, 0), (0, -1)]
-        self.environment.step(dirs[np.random.choice(len(dirs))])
+        dir = self.choose_dir()
+
+        self.environment.step(dir)
 
     def visualize(self) -> np.ndarray:
         """
